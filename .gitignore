@@ -1,0 +1,32 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs and runtime outputs
+*.log
+outputs/
+infer_py/*.tsv
+infer_py/*.bed
+infer_py/*.bedpe
+NCFF135MUT_CTCF_untreated/
+data/12878.mcool
+# Generated data/cache (reproducible)
+data_generated/cache/
+data_generated/packs/
+
+# Large raw analysis outputs
+stripenn_out/
+tad/insul_*
+fdr_thresholds_5000/
+
+# System files
+.DS_Store
+Thumbs.db
