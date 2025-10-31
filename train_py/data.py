@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -52,6 +53,50 @@ def load_tad_boundaries(path: str, binsize: int) -> Dict[str, List[int]]:
         per_chrom.setdefault(str(chrom), []).append(b)
     for chrom in per_chrom:
         per_chrom[chrom] = sorted(set(per_chrom[chrom]))
+    return per_chrom
+
+
+def load_tad_negatives(path: str, binsize: int) -> Dict[str, List[int]]:
+    if not path or not os.path.exists(path):
+        return {}
+    df = np.loadtxt(path, dtype=str)
+    if df.ndim == 1:
+        df = df[None, :]
+    per_chrom: Dict[str, List[int]] = {}
+    for row in df:
+        chrom, start, _ = row
+        try:
+            bp = int(float(start))
+        except Exception:
+            continue
+        b = bp // binsize
+        per_chrom.setdefault(str(chrom), []).append(b)
+    for chrom in per_chrom:
+        per_chrom[chrom] = sorted(set(per_chrom[chrom]))
+    return per_chrom
+
+
+def load_tad_domains(path: str, binsize: int) -> Dict[str, List[Tuple[int, int]]]:
+    if not path or not os.path.exists(path):
+        return {}
+    df = np.loadtxt(path, dtype=str)
+    if df.ndim == 1:
+        df = df[None, :]
+    per_chrom: Dict[str, List[Tuple[int, int]]] = {}
+    for row in df:
+        chrom, start, end = row[:3]
+        try:
+            s_bp = int(float(start))
+            e_bp = int(float(end))
+        except Exception:
+            continue
+        if e_bp <= s_bp:
+            continue
+        s_bin = s_bp // binsize
+        e_bin = int(np.ceil(e_bp / binsize))
+        per_chrom.setdefault(str(chrom), []).append((s_bin, e_bin))
+    for chrom in per_chrom:
+        per_chrom[chrom] = sorted(per_chrom[chrom])
     return per_chrom
 
 
@@ -151,6 +196,7 @@ class LoopDataset(Dataset):
         self.binsize = binsize
         self.include_tad_prior = include_tad_prior
 
+        self.binsize = binsize
         manifest_path = os.path.join(paths.manifest_root, manifest_name)
         label_path = os.path.join(paths.label_root, label_name)
         tad_path = os.path.join(paths.label_root, 'tad_boundaries_10kb.bed')
@@ -164,37 +210,29 @@ class LoopDataset(Dataset):
         self.tad_boundaries = load_tad_boundaries(tad_path, binsize=10000) if include_tad_prior else {}
 
         # storage
-        pack_path = os.path.join(paths.cache_root, 'loop_5kb.h5')
-        use_h5_env = os.environ.get('AAA_MIL_USE_H5', '1').lower() in ('1','true','yes','y','on')
-        if paths.use_hdf5 and use_h5_env and os.path.exists(pack_path):
-            self.storage_h5 = {
-                'X': H5Array(pack_path, 'X'),
-                'chrom': H5Array(pack_path, 'chrom'),
-                'x0': H5Array(pack_path, 'x0'),
-                'patch': H5Array(pack_path, 'patch')
-            }
-            self.use_h5 = True
-        else:
-            self.use_h5 = False
-            self.cache_dir = os.path.join(paths.cache_root, 'loop_5kb')
+        self.use_h5 = False
+        self.cache_dir = os.path.join(paths.cache_root, 'loop_5kb')
 
         self.distance_cache = distance_channel(center)
 
     def __len__(self):
         return len(self.entries)
 
-    def _load_patch(self, idx: int) -> Tuple[np.ndarray, str, int]:
+    def _load_patch(self, idx: int) -> Tuple[np.ndarray, np.ndarray, str, int]:
         entry = self.entries[idx]
         chrom = str(entry['chrom'])
         x0 = int(entry['x0'])
         patch = int(entry['patch'])
-        if self.use_h5:
-            X = self.storage_h5['X'][idx]
+        path_raw = os.path.join(self.cache_dir, f"loop_{chrom}_x{x0}_p{patch}.npz")
+        with np.load(path_raw, allow_pickle=True) as npz:
+            raw = npz['X']
+        path_kr = os.path.join(self.cache_dir, f"loop_{chrom}_x{x0}_p{patch}_kr.npz")
+        if os.path.exists(path_kr):
+            with np.load(path_kr, allow_pickle=True) as npz:
+                kr = npz['X']
         else:
-            path = os.path.join(self.cache_dir, f"loop_{chrom}_x{x0}_p{patch}.npz")
-            with np.load(path, allow_pickle=True) as npz:
-                X = npz['X']
-        return X, chrom, x0
+            kr = raw
+        return raw, kr, chrom, x0
 
     def _tad_corner_prior(self, chrom: str, c0_bin: int, center_bins: int) -> torch.Tensor:
         # Build corner priors from TAD boundaries (10kb). Map to 5kb bins by scaling.
@@ -227,8 +265,9 @@ class LoopDataset(Dataset):
         x0 = int(entry['x0'])
         patch = int(entry['patch'])
         center = int(entry['center'])
-        X, chrom, x0 = self._load_patch(idx)
-        X = torch.from_numpy(X).float()
+        raw_np, kr_np, chrom, x0 = self._load_patch(idx)
+        raw_tensor = torch.from_numpy(raw_np).float()
+        kr_tensor = torch.from_numpy(kr_np).float()
 
         # central crop for supervision
         c0_bin = x0 + (patch - center) // 2
@@ -259,9 +298,9 @@ class LoopDataset(Dataset):
                 valid[ix, iy] = 1.0
 
         dist = self.distance_cache
-        # robust center crop independent of stored patch size
-        central_patch = center_crop_pad2d(X, center)
-        input_tensor = torch.stack([central_patch, dist], dim=0)
+        central_raw = center_crop_pad2d(raw_tensor, center)
+        central_kr = center_crop_pad2d(kr_tensor, center)
+        input_tensor = torch.stack([central_raw, central_kr, dist], dim=0)
 
         item = {
             'task': 'loop',
@@ -302,37 +341,29 @@ class StripeDataset(Dataset):
         self.stripe_labels = load_stripe_labels(label_path)
         self.tad_boundaries = load_tad_boundaries(tad_path, binsize=10000) if add_tad_prior else {}
 
-        pack_path = os.path.join(paths.cache_root, 'stripe_10kb.h5')
-        use_h5_env = os.environ.get('AAA_MIL_USE_H5', '1').lower() in ('1','true','yes','y','on')
-        if paths.use_hdf5 and use_h5_env and os.path.exists(pack_path):
-            self.use_h5 = True
-            self.storage_h5 = {
-                'X': H5Array(pack_path, 'X'),
-                'chrom': H5Array(pack_path, 'chrom'),
-                'x0': H5Array(pack_path, 'x0'),
-                'patch': H5Array(pack_path, 'patch')
-            }
-        else:
-            self.use_h5 = False
-            self.cache_dir = os.path.join(paths.cache_root, 'stripe_10kb')
+        self.use_h5 = False
+        self.cache_dir = os.path.join(paths.cache_root, 'stripe_10kb')
 
         self.distance_cache = distance_channel(center)
 
     def __len__(self):
         return len(self.entries)
 
-    def _load_patch(self, idx: int) -> Tuple[np.ndarray, str, int]:
+    def _load_patch(self, idx: int) -> Tuple[np.ndarray, np.ndarray, str, int]:
         entry = self.entries[idx]
         chrom = str(entry['chrom'])
         x0 = int(entry['x0'])
         patch = int(entry['patch'])
-        if self.use_h5:
-            X = self.storage_h5['X'][idx]
+        path_raw = os.path.join(self.cache_dir, f"stripe_{chrom}_x{x0}_p{patch}.npz")
+        with np.load(path_raw, allow_pickle=True) as npz:
+            raw = npz['X']
+        path_kr = os.path.join(self.cache_dir, f"stripe_{chrom}_x{x0}_p{patch}_kr.npz")
+        if os.path.exists(path_kr):
+            with np.load(path_kr, allow_pickle=True) as npz:
+                kr = npz['X']
         else:
-            path = os.path.join(self.cache_dir, f"stripe_{chrom}_x{x0}_p{patch}.npz")
-            with np.load(path, allow_pickle=True) as npz:
-                X = npz['X']
-        return X, chrom, x0
+            kr = raw
+        return raw, kr, chrom, x0
 
     def _tad_band_prior(self, chrom: str, c0_bin: int, center_bins: int) -> torch.Tensor:
         boundaries = self.tad_boundaries.get(chrom, [])
@@ -353,8 +384,9 @@ class StripeDataset(Dataset):
         patch = int(entry['patch'])
         center = int(entry['center'])
 
-        X, chrom, x0 = self._load_patch(idx)
-        X = torch.from_numpy(X).float()
+        raw_np, kr_np, chrom, x0 = self._load_patch(idx)
+        raw_tensor = torch.from_numpy(raw_np).float()
+        kr_tensor = torch.from_numpy(kr_np).float()
         c0_bin = x0 + (patch - center)//2
         cx0_bp = c0_bin * self.binsize
         cx1_bp = cx0_bp + center * self.binsize
@@ -371,8 +403,16 @@ class StripeDataset(Dataset):
             by2 = min(center, int(math.ceil((y2 - cx0_bp)/self.binsize)))
             mask[by1:by2, bx1:bx2] = 1.0
 
-        central_patch = center_crop_pad2d(X, center)
-        inputs = torch.stack([central_patch, self.distance_cache], dim=0)
+        central_raw = center_crop_pad2d(raw_tensor, center)
+        central_kr = center_crop_pad2d(kr_tensor, center)
+        inputs = torch.stack([central_raw, central_kr, self.distance_cache], dim=0)
+
+        vert = torch.clamp(central_raw - central_raw.mean(dim=0, keepdim=True), min=0.0)
+        hor = torch.clamp(central_raw - central_raw.mean(dim=1, keepdim=True), min=0.0)
+        orientation = torch.max(vert, hor)
+        if orientation.max() > 0:
+            orientation = orientation / orientation.max()
+        orientation_prior = orientation.unsqueeze(0)
 
         item = {
             'task': 'stripe',
@@ -387,126 +427,177 @@ class StripeDataset(Dataset):
         }
         if self.add_tad_prior:
             item['target']['boundary_prior'] = self._tad_band_prior(chrom, c0_bin, center).unsqueeze(0)
+        item['target']['orientation_prior'] = orientation_prior
         return item
 
 
 class TADDataset(Dataset):
-    def __init__(self, paths: DatasetPaths, manifest_name: str, label_name: str,
-                 band_width: int, ignore_bins: int=32, binsize: int=10000):
-        self.band_width = band_width
-        self.ignore_bins = ignore_bins
+    def __init__(self, paths: DatasetPaths, manifest_name: str, binsize: int = 10000,
+                 domain_label_name: str = "tad_domains_10kb.bed",
+                 use_detection: bool = False,
+                 min_bins: int = 4,
+                 max_instances: int = 16):
         self.binsize = binsize
-
         manifest_path = os.path.join(paths.manifest_root, manifest_name)
         with open(manifest_path, 'r') as f:
             self.entries = [json.loads(line) for line in f if line.strip()]
-
-        tad_path = os.path.join(paths.label_root, label_name)
-        self.boundaries = load_tad_boundaries(tad_path, binsize=binsize)
-
-        pack_path = os.path.join(paths.cache_root, 'tad_10kb_1d.h5')
-        use_h5_env = os.environ.get('AAA_MIL_USE_H5', '1').lower() in ('1','true','yes','y','on')
-        if paths.use_hdf5 and use_h5_env and os.path.exists(pack_path):
-            self.use_h5 = True
-            self.storage_h5 = {
-                'band': H5Array(pack_path, 'band'),
-                'chrom': H5Array(pack_path, 'chrom'),
-                'start_bin': H5Array(pack_path, 'start_bin')
-            }
-            self.binsize_attr = int(self.storage_h5['band'].attrs()['binsize'])
-        else:
-            self.use_h5 = False
-            self.cache_dir = os.path.join(paths.cache_root, 'tad_10kb_1d')
+        self.cache_dir = os.path.join(paths.cache_root, 'tad_10kb_2d')
+        self.distance_cache: Dict[int, torch.Tensor] = {}
+        self.use_detection = use_detection
+        self.min_bins = min_bins
+        self.max_instances = max_instances
+        label_path = os.path.join(paths.label_root, domain_label_name) if domain_label_name else None
+        self.domain_intervals = load_tad_domains(label_path, binsize) if (self.use_detection and label_path) else {}
 
     def __len__(self):
         return len(self.entries)
 
-    def _load(self, idx: int) -> Tuple[np.ndarray, np.ndarray, str, int, int]:
-        entry = self.entries[idx]
-        chrom = str(entry['chrom'])
-        start_bin = int(entry['start_bin'])
-        L = int(entry.get('length', 1024))
-        if self.use_h5:
-            band = self.storage_h5['band'][idx]
-            chrom = self.storage_h5['chrom'][idx].astype(str)
-            start_bin = int(self.storage_h5['start_bin'][idx])
-            # load entire patch? store? to keep compatibility, we require dataset to fetch from cooler? For now band only.
-            X = None
-        else:
-            path = os.path.join(self.cache_dir, f"tad1d_{chrom}_s{start_bin}_L{L}_B{self.band_width}.npz")
-            with np.load(path, allow_pickle=True) as npz:
-                band = npz['band']
-                X = npz['X'] if 'X' in npz.files else None
-        return band, X, chrom, start_bin, L
+    def _distance(self, size: int) -> torch.Tensor:
+        if size not in self.distance_cache:
+            self.distance_cache[size] = distance_channel(size)
+        return self.distance_cache[size]
+
+    def _load_npz(self, chrom: str, x0: int, patch: int) -> Dict[str, Any]:
+        path = os.path.join(self.cache_dir, f"tad2d_{chrom}_x{x0}_p{patch}.npz")
+        with np.load(path, allow_pickle=True) as npz:
+            return {k: npz[k] for k in npz.files}
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         entry = self.entries[idx]
         chrom = str(entry['chrom'])
-        start_bin = int(entry['start_bin'])
-        L = int(entry.get('length', 1024))
-        band, X_patch, chrom_loaded, start_bin_loaded, L_loaded = self._load(idx)
-        if chrom_loaded is not None:
-            chrom = str(chrom_loaded)
-        start_bin = start_bin_loaded
-        L = L_loaded
-        band = torch.from_numpy(band).float()
-        if X_patch is not None:
-            X_tensor = torch.from_numpy(X_patch).float()
-        else:
-            diag_vec = band.mean(dim=0)
-            X_tensor = torch.zeros((L, L), dtype=torch.float32)
-            idx = torch.arange(L)
-            X_tensor[idx, idx] = diag_vec
-        # unify size to (L,L)
-        if X_tensor.shape[-2] != L or X_tensor.shape[-1] != L:
-            H, W = X_tensor.shape[-2], X_tensor.shape[-1]
-            # crop or pad bottom-right
-            X_fix = torch.zeros((L, L), dtype=torch.float32)
-            h = min(L, H); w = min(L, W)
-            X_fix[:h, :w] = X_tensor[:h, :w]
-            X_tensor = X_fix
+        x0 = int(entry['x0'])
+        patch = int(entry['patch'])
+        center = int(entry.get('center', patch))
+        binsize = int(entry.get('binsize', self.binsize))
 
-        boundary_bins = self.boundaries.get(chrom, [])
-        target = torch.zeros((L,), dtype=torch.float32)
-        for b in boundary_bins:
-            j = b - start_bin
-            if 0 <= j < L:
-                target[j] = 1.0
-        if self.ignore_bins > 0:
-            mask = torch.ones((L,), dtype=torch.float32)
-            mask[:self.ignore_bins] = 0.0
-            mask[-self.ignore_bins:] = 0.0
-        else:
-            mask = torch.ones((L,), dtype=torch.float32)
+        data_npz = self._load_npz(chrom, x0, patch)
+        raw_full = torch.from_numpy(data_npz['raw']).float()
+        kr_full = torch.from_numpy(data_npz['kr']).float()
+        domain_full = torch.from_numpy(data_npz['domain']).float()
+        boundary_thin_full = torch.from_numpy(data_npz.get('boundary', np.zeros_like(data_npz['domain']))).float()
+        boundary_wide_full = torch.from_numpy(data_npz.get('boundary_wide', np.zeros_like(data_npz['domain']))).float()
 
-        # ensure two channels (image + distance)
-        dist = distance_channel(L)
-        inputs = torch.stack([X_tensor, dist], dim=0)
+        offset = max(0, (patch - center) // 2)
+        raw_center = center_crop_pad2d(raw_full, center)
+        kr_center = center_crop_pad2d(kr_full, center)
+        domain_center = center_crop_pad2d(domain_full, center)
+        boundary_thin_center = center_crop_pad2d(boundary_thin_full, center)
+        boundary_wide_center = center_crop_pad2d(boundary_wide_full, center)
+
+        inputs = torch.stack([raw_center, kr_center, self._distance(center)], dim=0)
+        domain_mask = domain_center.unsqueeze(0)
+        boundary_mask = boundary_thin_center.unsqueeze(0)
+        boundary_wide = boundary_wide_center.unsqueeze(0)
 
         item = {
             'task': 'tad',
             'inputs': inputs,
-            'inputs_band': band,
             'target': {
-                'boundary': target,
-                'ignore': mask
+                'domain_mask': domain_mask,
+                'boundary_mask': boundary_mask,
+                'boundary_wide': boundary_wide
             },
             'metadata': {
                 'chrom': chrom,
-                'start_bin': int(start_bin)
+                'bin_start': int(x0 + offset),
+                'patch_start': int(x0),
+                'center': int(center),
+                'binsize': binsize
             }
         }
+        if self.use_detection:
+            detection = self._build_detection_targets(chrom, x0 + offset, center)
+            item['detection'] = detection
         return item
+
+    def _build_detection_targets(self, chrom: str, window_start: int, size: int) -> Dict[str, torch.Tensor]:
+        intervals = self.domain_intervals.get(chrom, [])
+        boxes: List[List[float]] = []
+        masks: List[torch.Tensor] = []
+        labels: List[int] = []
+        for start, end in intervals:
+            if end <= window_start or start >= window_start + size:
+                continue
+            s = max(start, window_start)
+            e = min(end, window_start + size)
+            if (e - s) < self.min_bins:
+                continue
+            y1 = int(s - window_start)
+            y2 = int(e - window_start)
+            y1 = max(0, min(size, y1))
+            y2 = max(0, min(size, y2))
+            if y2 - y1 < 1:
+                continue
+            mask = torch.zeros((size, size), dtype=torch.float32)
+            mask[y1:y2, y1:y2] = 1.0
+            boxes.append([float(y1), float(y1), float(y2), float(y2)])
+            masks.append(mask)
+            labels.append(1)
+            if len(boxes) >= self.max_instances:
+                break
+
+        if boxes:
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels, dtype=torch.int64)
+            masks_tensor = torch.stack(masks)
+            areas = (boxes_tensor[:, 2] - boxes_tensor[:, 0]) * (boxes_tensor[:, 3] - boxes_tensor[:, 1])
+        else:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.int64)
+            masks_tensor = torch.zeros((0, size, size), dtype=torch.float32)
+            areas = torch.zeros((0,), dtype=torch.float32)
+
+        detection = {
+            'boxes': boxes_tensor,
+            'labels': labels_tensor,
+            'masks': masks_tensor,
+            'areas': areas,
+            'iscrowd': torch.zeros((labels_tensor.numel(),), dtype=torch.int64)
+        }
+        return detection
+
+
+
+def collate_tad_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    inputs = torch.stack([item['inputs'] for item in batch], dim=0)
+    targets = {
+        'domain_mask': torch.stack([item['target']['domain_mask'] for item in batch], dim=0),
+        'boundary_mask': torch.stack([item['target']['boundary_mask'] for item in batch], dim=0),
+        'boundary_wide': torch.stack([item['target']['boundary_wide'] for item in batch], dim=0),
+    }
+    metadata = [item.get('metadata', {}) for item in batch]
+    detection = [item.get('detection') for item in batch]
+    return {
+        'task': 'tad',
+        'inputs': inputs,
+        'target': targets,
+        'metadata': metadata,
+        'detection': detection
+    }
 
 
 def make_dataloaders(paths: DatasetPaths,
                      loop_center: int, loop_patch: int, loop_stride: int,
                      stripe_center: int, stripe_patch: int, stripe_stride: int,
-                     tad_length: int, tad_stride: int, tad_band_width: int, tad_ignore: int,
-                     batch_sizes: Dict[str, int], num_workers: int, pin_memory: bool) -> Dict[str, DataLoader]:
-    loop_ds = LoopDataset(paths, 'loop_5kb.jsonl', 'loop_5kb.jsonl', center=loop_center, patch=loop_patch, stride=loop_stride)
-    stripe_ds = StripeDataset(paths, 'stripe_10kb.jsonl', 'stripe_10kb.jsonl', center=stripe_center, patch=stripe_patch, stride=stripe_stride)
-    tad_ds = TADDataset(paths, 'tad_10kb_1d.jsonl', 'tad_boundaries_10kb.bed', band_width=tad_band_width, ignore_bins=tad_ignore)
+                     batch_sizes: Dict[str, int], num_workers: int, pin_memory: bool,
+                     loop_manifest_name: str = 'loop_5kb.jsonl',
+                     loop_label_name: str = 'loop_5kb.jsonl',
+                     stripe_manifest_name: str = 'stripe_10kb.jsonl',
+                     stripe_label_name: str = 'stripe_10kb.jsonl',
+                     tad_manifest_name: Optional[str] = None,
+                     tad_binsize: int = 10000,
+                     tad_domain_label_name: str = 'tad_domains_10kb.bed',
+                     tad_use_detection: bool = False,
+                     tad_detection_min_bins: int = 4,
+                     tad_detection_max_instances: int = 16) -> Dict[str, DataLoader]:
+    loop_ds = LoopDataset(paths, loop_manifest_name, loop_label_name, center=loop_center, patch=loop_patch, stride=loop_stride)
+    stripe_ds = StripeDataset(paths, stripe_manifest_name, stripe_label_name, center=stripe_center, patch=stripe_patch, stride=stripe_stride)
+    tad_manifest = tad_manifest_name or 'tad_10kb_2d.jsonl'
+    tad_ds = TADDataset(paths, tad_manifest, binsize=tad_binsize,
+                        domain_label_name=tad_domain_label_name,
+                        use_detection=tad_use_detection,
+                        min_bins=tad_detection_min_bins,
+                        max_instances=tad_detection_max_instances)
 
     common = dict(num_workers=num_workers,
                   pin_memory=pin_memory,
@@ -518,6 +609,7 @@ def make_dataloaders(paths: DatasetPaths,
     loaders = {
         'loop': DataLoader(loop_ds, batch_size=batch_sizes.get('loop', 4), shuffle=True, **common),
         'stripe': DataLoader(stripe_ds, batch_size=batch_sizes.get('stripe', 4), shuffle=True, **common),
-        'tad': DataLoader(tad_ds, batch_size=batch_sizes.get('tad', 8), shuffle=True, **common)
+        'tad': DataLoader(tad_ds, batch_size=batch_sizes.get('tad', 8), shuffle=True,
+                          collate_fn=collate_tad_batch, **common)
     }
     return loaders

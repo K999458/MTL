@@ -11,7 +11,7 @@
 """
 
 import argparse, os, json
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 import pandas as pd
 import cooler
@@ -50,15 +50,26 @@ def oe_log1p_clip(mat: np.ndarray, clip_percentile: float=98.0) -> np.ndarray:
     return m
 
 
+def _log1p_positive(mat: np.ndarray) -> np.ndarray:
+    m = np.clip(mat.astype(np.float32), a_min=0.0, a_max=None)
+    return np.log1p(m)
+
+
+def _save_npz(path: str, X: np.ndarray, chrom: str, x0: int, patch: int, binsize: int) -> None:
+    np.savez_compressed(path, X=X.astype(np.float32), chrom=chrom, x0=x0, patch=patch, binsize=binsize)
+
+
 def _worker_loop(item, uri: str, outdir: str, clip_pct: float) -> int:
     chrom = item['chrom']; x0 = int(item['x0']); patch = int(item['patch']); binsize = int(item['binsize'])
     start_bp = x0 * binsize; end_bp = (x0 + patch) * binsize
     clr = cooler.Cooler(uri)
-    mat = clr.matrix(balance=True).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
-    mat = np.asarray(mat, dtype=np.float32)
-    mat = oe_log1p_clip(mat, clip_percentile=clip_pct)
-    fn = f"loop_{chrom}_x{x0}_p{patch}.npz"
-    np.savez_compressed(os.path.join(outdir, fn), X=mat, chrom=chrom, x0=x0, patch=patch, binsize=binsize)
+    mat_raw = clr.matrix(balance=False).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
+    mat_bal = clr.matrix(balance=True).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
+    mat_raw = _log1p_positive(np.asarray(mat_raw))
+    mat_bal = oe_log1p_clip(np.asarray(mat_bal), clip_percentile=clip_pct)
+    base = os.path.join(outdir, f"loop_{chrom}_x{x0}_p{patch}")
+    _save_npz(base + ".npz", mat_raw, chrom, x0, patch, binsize)
+    _save_npz(base + "_kr.npz", mat_bal, chrom, x0, patch, binsize)
     return 1
 
 def cache_loop(manifest_path: str, uri: str, outdir: str, limit: Optional[int], clip_pct: float, workers: int):
@@ -89,11 +100,13 @@ def _worker_stripe(item, uri: str, outdir: str, clip_pct: float) -> int:
     chrom = item['chrom']; x0 = int(item['x0']); patch = int(item['patch']); binsize = int(item['binsize'])
     start_bp = x0 * binsize; end_bp = (x0 + patch) * binsize
     clr = cooler.Cooler(uri)
-    mat = clr.matrix(balance=True).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
-    mat = np.asarray(mat, dtype=np.float32)
-    mat = oe_log1p_clip(mat, clip_percentile=clip_pct)
-    fn = f"stripe_{chrom}_x{x0}_p{patch}.npz"
-    np.savez_compressed(os.path.join(outdir, fn), X=mat, chrom=chrom, x0=x0, patch=patch, binsize=binsize)
+    mat_raw = clr.matrix(balance=False).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
+    mat_bal = clr.matrix(balance=True).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
+    mat_raw = _log1p_positive(np.asarray(mat_raw))
+    mat_bal = oe_log1p_clip(np.asarray(mat_bal), clip_percentile=clip_pct)
+    base = os.path.join(outdir, f"stripe_{chrom}_x{x0}_p{patch}")
+    _save_npz(base + ".npz", mat_raw, chrom, x0, patch, binsize)
+    _save_npz(base + "_kr.npz", mat_bal, chrom, x0, patch, binsize)
     return 1
 
 def cache_stripe(manifest_path: str, uri: str, outdir: str, limit: Optional[int], clip_pct: float, workers: int):
@@ -175,16 +188,143 @@ def cache_tad1d(manifest_path: str, uri: str, outdir: str, band_width: int, limi
     return cnt
 
 
+# ---------- TAD 2D 相关 ----------
+DOMAIN_CACHE: Dict[str, List[Tuple[int, int]]] = {}
+TAD_BINSIZE: int = 10000
+BOUNDARY_THIN: int = 1
+BOUNDARY_WIDE: int = 3
+
+
+def _load_domain_cache(path: str, binsize: int) -> Dict[str, List[Tuple[int, int]]]:
+    if not path or not os.path.exists(path):
+        return {}
+    df = pd.read_csv(path, sep='\t', header=None, names=['chrom','start','end'])
+    df = df.dropna().copy()
+    df['start_bin'] = (df['start'].astype(int) // binsize)
+    df['end_bin'] = (df['end'].astype(int) + binsize - 1) // binsize
+    cache: Dict[str, List[Tuple[int,int]]] = {}
+    for chrom, g in df.groupby('chrom'):
+        cache[str(chrom)] = [(int(r['start_bin']), int(r['end_bin'])) for _, r in g.iterrows() if int(r['end_bin']) > int(r['start_bin'])]
+    return cache
+
+
+def _init_tad2d_context(domain_path: str, binsize: int):
+    global DOMAIN_CACHE, TAD_BINSIZE
+    DOMAIN_CACHE = _load_domain_cache(domain_path, binsize)
+    TAD_BINSIZE = binsize
+
+
+def _tad2d_masks(chrom: str, x0: int, patch: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    binsize = TAD_BINSIZE
+    interior = np.zeros((patch, patch), dtype=np.float32)
+    boundary_thin = np.zeros((patch, patch), dtype=np.float32)
+    boundary_wide = np.zeros((patch, patch), dtype=np.float32)
+    domains = DOMAIN_CACHE.get(chrom, [])
+    for s_bin, e_bin in domains:
+        local_s = s_bin - x0
+        local_e = e_bin - x0
+        if local_e <= 0 or local_s >= patch:
+            continue
+        ls = max(0, local_s)
+        le = min(patch, local_e)
+        if le <= ls:
+            continue
+        interior[ls:le, ls:le] = 1.0
+
+        # thin boundary (width = 1)
+        boundary_thin[ls, ls:le] = 1.0
+        boundary_thin[le - 1, ls:le] = 1.0
+        boundary_thin[ls:le, ls] = 1.0
+        boundary_thin[ls:le, le - 1] = 1.0
+
+        # wide boundary ring
+        for bw in range(BOUNDARY_WIDE):
+            top = max(0, ls - bw)
+            bottom = min(patch - 1, le - 1 + bw)
+            left = max(0, ls - bw)
+            right = min(patch - 1, le - 1 + bw)
+            boundary_wide[top, left:right + 1] = 1.0
+            boundary_wide[bottom, left:right + 1] = 1.0
+            boundary_wide[top:bottom + 1, left] = 1.0
+            boundary_wide[top:bottom + 1, right] = 1.0
+
+    boundary_wide = np.clip(boundary_wide, 0.0, 1.0)
+    boundary_thin = np.clip(boundary_thin, 0.0, 1.0)
+    return interior, boundary_thin, boundary_wide
+
+
+def _worker_tad2d(item, uri: str, outdir: str, clip_pct: float) -> int:
+    chrom = str(item['chrom']); x0 = int(item['x0']); patch = int(item['patch']); binsize = int(item['binsize'])
+    start_bp = x0 * binsize; end_bp = (x0 + patch) * binsize
+    clr = cooler.Cooler(uri)
+    mat_raw = clr.matrix(balance=False).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
+    mat_bal = clr.matrix(balance=True).fetch(f"{chrom}:{start_bp}-{end_bp}", f"{chrom}:{start_bp}-{end_bp}")
+    mat_raw = _log1p_positive(np.asarray(mat_raw))
+    mat_bal = oe_log1p_clip(np.asarray(mat_bal), clip_percentile=clip_pct)
+    interior_mask, boundary_thin, boundary_wide = _tad2d_masks(chrom, x0, patch)
+    base = os.path.join(outdir, f"tad2d_{chrom}_x{x0}_p{patch}")
+    np.savez_compressed(
+        base + ".npz",
+        raw=mat_raw.astype(np.float32),
+        kr=mat_bal.astype(np.float32),
+        domain=interior_mask,
+        boundary=boundary_thin,
+        boundary_wide=boundary_wide,
+        chrom=chrom,
+        x0=x0,
+        patch=patch,
+        binsize=binsize
+    )
+    return 1
+
+
+def cache_tad2d(manifest_path: str, uri: str, outdir: str, domain_path: str,
+                binsize: int, limit: Optional[int], clip_pct: float, workers: int):
+    ensure_dir(outdir)
+    if limit is not None and limit <= 0:
+        limit = None
+    items = []
+    with open(manifest_path, 'r') as f:
+        for line in f:
+            it = json.loads(line)
+            items.append(it)
+            if limit is not None and len(items) >= limit:
+                break
+    if not items:
+        return 0
+    if workers is None:
+        workers = 1
+    if workers <= 1:
+        _init_tad2d_context(domain_path, binsize)
+        cnt = 0
+        for it in items:
+            cnt += _worker_tad2d(it, uri, outdir, clip_pct)
+        return cnt
+    else:
+        init_args = (domain_path, binsize)
+        cnt = 0
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_tad2d_context, initargs=init_args) as ex:
+            futs = [ex.submit(_worker_tad2d, it, uri, outdir, clip_pct) for it in items]
+            for _ in as_completed(futs):
+                cnt += 1
+        return cnt
+
+
 def main():
     ap = argparse.ArgumentParser(description='缓存 Hi-C 矩阵切片为 .npz (loop/stripe/tad1d)')
     ap.add_argument('--mcool', required=True, help='.mcool 或 mcool::/resolutions/N 基路径')
-    ap.add_argument('--manifests', required=True, help='manifests 目录（包含 loop_5kb.jsonl / stripe_10kb.jsonl / tad_10kb_1d.jsonl）')
+    ap.add_argument('--manifests', required=True, help='manifests 目录（至少包含 loop_5kb.jsonl / stripe_10kb.jsonl）')
     ap.add_argument('--outdir', required=True, help='输出根目录 e.g. AAA_MIL/data_generated/cache')
     ap.add_argument('--band-width', type=int, default=64, help='TAD 1D 带宽 B [默认 64]')
     ap.add_argument('--percentile', type=float, default=98.0, help='分位裁剪上限 [默认 98]')
     ap.add_argument('--limit-loop', type=int, default=None, help='限制 Loop 切片数量（便于测试）')
     ap.add_argument('--limit-stripe', type=int, default=None, help='限制 Stripe 切片数量')
+    ap.add_argument('--tad1d-manifest', default=None, help='可选，TAD 1D manifest 路径；缺省则跳过 1D 缓存')
     ap.add_argument('--limit-tad', type=int, default=None, help='限制 TAD 1D 切片数量')
+    ap.add_argument('--tad2d-manifest', default=None, help='可选，TAD 2D manifest 路径')
+    ap.add_argument('--domain-bed', default=None, help='TAD 域 BED（用于 2D 标签）')
+    ap.add_argument('--tad2d-binsize', type=int, default=10000, help='TAD 2D bin 大小 [默认 10000]')
+    ap.add_argument('--limit-tad2d', type=int, default=None, help='限制 TAD 2D 切片数量')
     ap.add_argument('--workers', type=int, default=max(1, mp.cpu_count()//2), help='并行进程数 [默认: CPU/2]')
     args = ap.parse_args()
 
@@ -195,17 +335,29 @@ def main():
 
     loop_manifest   = os.path.join(args.manifests, 'loop_5kb.jsonl')
     stripe_manifest = os.path.join(args.manifests, 'stripe_10kb.jsonl')
-    tad_manifest    = os.path.join(args.manifests, 'tad_10kb_1d.jsonl')
-
     out_loop   = os.path.join(args.outdir, 'loop_5kb')
     out_stripe = os.path.join(args.outdir, 'stripe_10kb')
     out_tad    = os.path.join(args.outdir, 'tad_10kb_1d')
 
     n1 = cache_loop(loop_manifest, uri5, out_loop, args.limit_loop, args.percentile, args.workers)
     n2 = cache_stripe(stripe_manifest, uri10, out_stripe, args.limit_stripe, args.percentile, args.workers)
-    n3 = cache_tad1d(tad_manifest, uri10, out_tad, args.band_width, args.limit_tad, args.percentile, args.workers)
+    n3 = 0
+    if args.tad1d_manifest:
+        tad_manifest = args.tad1d_manifest if os.path.isabs(args.tad1d_manifest) else os.path.join(args.manifests, args.tad1d_manifest)
+        n3 = cache_tad1d(tad_manifest, uri10, out_tad, args.band_width, args.limit_tad, args.percentile, args.workers)
 
-    print(f"[cache] loop={n1}, stripe={n2}, tad1d={n3}")
+    tad2d_manifest = args.tad2d_manifest
+    n4 = 0
+    if tad2d_manifest:
+        if not args.domain_bed:
+            raise ValueError("--tad2d-manifest 需要配合 --domain-bed")
+        if not os.path.isabs(tad2d_manifest):
+            tad2d_manifest = os.path.join(args.manifests, tad2d_manifest)
+        out_tad2d = os.path.join(args.outdir, 'tad_10kb_2d')
+        n4 = cache_tad2d(tad2d_manifest, uri10, out_tad2d, args.domain_bed,
+                         args.tad2d_binsize, args.limit_tad2d, args.percentile, args.workers)
+
+    print(f"[cache] loop={n1}, stripe={n2}, tad1d={n3}, tad2d={n4}")
 
 
 if __name__ == '__main__':

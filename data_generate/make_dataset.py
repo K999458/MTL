@@ -71,11 +71,11 @@ def generate_loop_manifest(clr5: cooler.Cooler, patch: int, center: int, stride:
     return mani
 
 
-def generate_stripe_manifest(clr10: cooler.Cooler, patch: int, center: int, stride: int) -> List[Dict]:
+def _generate_diag_manifest(clr: cooler.Cooler, patch: int, center: int, stride: int) -> List[Dict]:
     mani = []
-    binsize = int(clr10.binsize)
-    for chrom in chrom_names(clr10):
-        nbins = clr10.bins().fetch(chrom).shape[0]
+    binsize = int(clr.binsize)
+    for chrom in chrom_names(clr):
+        nbins = clr.bins().fetch(chrom).shape[0]
         for x0 in diagonal_windows(nbins, patch, stride):
             mani.append({
                 'chrom': chrom,
@@ -87,6 +87,14 @@ def generate_stripe_manifest(clr10: cooler.Cooler, patch: int, center: int, stri
                 'stride': stride
             })
     return mani
+
+
+def generate_stripe_manifest(clr10: cooler.Cooler, patch: int, center: int, stride: int) -> List[Dict]:
+    return _generate_diag_manifest(clr10, patch, center, stride)
+
+
+def generate_tad2d_manifest(clr10: cooler.Cooler, patch: int, center: int, stride: int) -> List[Dict]:
+    return _generate_diag_manifest(clr10, patch, center, stride)
 
 
 def generate_tad1d_manifest(clr10: cooler.Cooler, L: int, stride: int) -> List[Dict]:
@@ -242,6 +250,9 @@ def main():
     ap.add_argument('--stripe-stride', type=int, default=128)
     ap.add_argument('--tad-L', type=int, default=1024)
     ap.add_argument('--tad-stride', type=int, default=512)
+    ap.add_argument('--tad2d-patch', type=int, default=320, help='TAD 2D patch 大小 [默认 320]')
+    ap.add_argument('--tad2d-center', type=int, default=256, help='TAD 2D 中心区域 [默认 256]')
+    ap.add_argument('--tad2d-stride', type=int, default=128, help='TAD 2D 滑窗步长 [默认 128]')
     args = ap.parse_args()
 
     # 解析 cooler
@@ -275,10 +286,12 @@ def main():
     loop_mani   = generate_loop_manifest(clr5,  args.loop_patch,   args.loop_center,   args.loop_stride)
     stripe_mani = generate_stripe_manifest(clr10, args.stripe_patch, args.stripe_center, args.stripe_stride)
     tad_mani    = generate_tad1d_manifest(clr10, args.tad_L, args.tad_stride)
+    tad2d_mani  = generate_tad2d_manifest(clr10, args.tad2d_patch, args.tad2d_center, args.tad2d_stride)
 
     write_jsonl(os.path.join(out_manis, 'loop_5kb.jsonl'),   loop_mani)
     write_jsonl(os.path.join(out_manis, 'stripe_10kb.jsonl'), stripe_mani)
     write_jsonl(os.path.join(out_manis, 'tad_10kb_1d.jsonl'), tad_mani)
+    write_jsonl(os.path.join(out_manis, 'tad_10kb_2d.jsonl'), tad2d_mani)
 
     print('[done] 输出：')
     print('  ', tad_bed_out)
@@ -287,6 +300,7 @@ def main():
     print('  ', os.path.join(out_manis, 'loop_5kb.jsonl'))
     print('  ', os.path.join(out_manis, 'stripe_10kb.jsonl'))
     print('  ', os.path.join(out_manis, 'tad_10kb_1d.jsonl'))
+    print('  ', os.path.join(out_manis, 'tad_10kb_2d.jsonl'))
 
 
 if __name__ == '__main__':

@@ -17,7 +17,7 @@
 
 ### 训练日志与指标（新增）
 为便于监控训练效果，已在 `train_py/trainer.py` 增加基础评估指标：
-- TAD：`tad_acc / tad_prec / tad_rec / tad_f1`（对 `ignore`=1 的区域统计，阈值 0.5）
+- TAD：`tad_map_iou / tad_map_dice / tad_boundary_iou / tad_boundary_dice`（域/边界概率图按 `tad_domain_threshold`、`tad_boundary_threshold` 二值化后统计）
 - Stripe：`stripe_iou / stripe_dice`（按 0.5 阈值二值化）
 - Loop：`loop_hit`（不计算 IoU；将预测热图阈值化后，与“有效 bin”（`valid`）做±1 bin 膨胀后任意重叠即记为命中；批内取命中率）
 
@@ -42,14 +42,15 @@
 - Loop（5kb）：将监督热图从高斯改为“单像素点”标签，并对称标注 (i,j) 与 (j,i)，与 Hi-C 对称性一致。
   - 代码变更：`train_py/data.py` 的 `LoopDataset.__getitem__` 中同时对称写入 `heat/offset/valid`，表达式 `heat[iy,ix]=1; heat[ix,iy]=1; offset[:,iy,ix]=0; offset[:,ix,iy]=0; valid[iy,ix]=valid[ix,iy]=1`。
 - Stripe（10kb）：维持矩形区域标签，确认坐标采用 0-based 半开（由 Stripenn 1-based 闭区间统一转为 0-based 半开存入 JSONL）。
-- TAD（10kb）：训练标签为 1D 边界向量；推理阶段新增把边界配对输出 TAD 域（`tads_pred_chr2.bed`）。
+- TAD（10kb）：以边界为核心的二维标签，来自 `tad/arhead.bed`。缓存阶段仅标注域边界环（内部置 0），并额外生成一次膨胀的边界掩码供训练使用。
 
 ### 重新生成数据与标签（流程）
 - Loops（BEDPE → JSONL）：读取 `hiccups_loop_5k_change.bedpe`，取每列 `chr1,x1,x2,chr2,y1,y2`，计算每锚点中心（或直接使用 x1/x2 等 5kb 对齐坐标），写入 `data_generated/labels/loop_5kb.jsonl` 字段 `{chrom,p1,p2}`（bp，0-based）。
 - Stripes（Stripenn TSV → JSONL）：读取 `stripenn_out/result_filtered.tsv`，仅保留 cis 行，并将 1-based 闭区间转换为 0-based 半开，写入 `data_generated/labels/stripe_10kb.jsonl` 字段 `{chrom,x1,x2,y1,y2}`（bp）。
-- TAD（BED → BED）：整合 `tad/di_*.bed` 与 `tad/tad_boundaries_is_10kb.bed`（可取并集或高置信子集），生成最终边界 `tad_boundaries_10kb.bed`（三列：chrom start end，10kb 步长）。
-- Manifests：根据目标分辨率（5kb/10kb）与裁剪参数，生成/更新 `data_generated/manifests/*.jsonl`（字段包含 `chrom,x0,y0,binsize,patch,center,stride`）。
-- 缓存：运行既有数据切块流程，产出 `data_generated/cache/{loop_5kb|stripe_10kb|tad_10kb_1d}/*.npz` 或对应 `.h5`。
+- TAD 域集合：直接使用 `tad/arhead.bed`（高置信域列表，已对齐 10kb 网格）。该文件可作为 `cache_patches.py --domain-bed` 的输入，生成 `data_generated/cache/tad_10kb_2d/` 下的域/边界缓存。
+- TAD 边界：若需 Loop/Stripe 先验，可将 `tad/arhead.bed` 中每个域的起止位置拆分为边界，写入 `data_generated/labels/tad_boundaries_10kb.bed`（三列：chrom start end，10kb 步长）。
+- Manifests：核心使用 `tad_10kb_2d.jsonl`（可通过 `data_generate/make_dataset.py` 自动生成；默认 patch=320、center=256、stride=128）。若仍需 1D 训练，可额外维护 `tad_10kb_1d.jsonl`。
+- 缓存：`data_generate/cache_patches.py` 通过 `--tad2d-manifest` 在 `data_generated/cache/tad_10kb_2d/` 下生成 `raw/kr/domain/boundary` 等字段；若想额外生成 1D 缓存，需要显式提供 `--tad1d-manifest`。
 
 注意：重新生成标签后，请确保 `train_config.json` 与 `train_py/config.py` 中路径、center/patch/stride 与 labels 坐标体系一致（5kb/10kb）。
 
@@ -60,5 +61,9 @@
 ### 训练调参与 Loader 控制
 - Loop 热图损失改为显式的加权 BCE：`loop_pos_weight`（默认 20000）控制正样本权重，标签仍为“单像素点”。必要时可在 `train_config.json` 覆写该值，以匹配实际的正/负样本比例。
 - Stripe 掩码损失加入正样本权重 + 面积惩罚：`stripe_pos_weight`（默认 25.0）提升正例梯度，`stripe_area_weight`（默认 0.05）通过 `max(0, mean(pred) - mean(gt))` 抑制大面积假阳性；若条纹仍过粗，可适当增大面积惩罚。
-- TAD 边界损失同样支持 `tad_pos_weight`（默认 8.0），使 1D 边界峰值更突出，配合后续域构建时更易阈值化。
+- TAD 分支基于多尺度 FPN + 对角细化：主干聚合 `c4/u3/u2/u1` 四级特征，融合 Loop/Stripe 共享特征后，经 Squeeze-Excite 与对角卷积增强；输出的 `domain_map` 对应细边界环，`boundary_map` 对应膨胀后的边界带。`tad_domain_map_weight` 约束核心边界，`tad_boundary_weight`/`tad_boundary_pos_weight` 专门提升膨胀边界的梯度。
+- 推理阶段（`infer_chr2.py`）：Loop 做 ±2 bin 邻域去重；Stripe 采用低阈值连通域 + 均值/峰值/长宽比过滤；TAD 先以 `tad_domain_threshold` 累积 patch 内域概率，再利用 `boundary_map` 沿行/列投影提取边界候选，结合连通域后按 `tad_min_bins` 过滤跨度，最终输出 `tad_boundaries_is_10kb_pred_chr2.bed` 与 `tads_pred_chr2.bed`。
 - 数据加载支持按环境变量切换 HDF5/npz：设置 `AAA_MIL_USE_H5=0` 可强制使用 `.npz`，避免在网络盘上因多进程读取 HDF5 造成的假死。
+- Loop/Stripe 输入现为三通道 `[raw log1p, KR O/E log1p, distance]`，配置项 `input_channels` 默认 3，可按需要调整；Loop 主要依赖 KR 特征，Stripe 则可利用原始矩阵强化条纹/loop 线索。
+- Stripe 样本附带 `orientation_prior`（根据 raw 矩阵纵横残差构建），损失中以 `stripe_orientation_weight`（默认 0.05）约束预测更贴合高强度竖/横条带。
+- 数据缓存脚本会同步生成 `*_kr.npz`（KR O/E）与原始 `*.npz`；`fill_missing_2d.py` 已支持自动补齐双版本，重新缓存时注意磁盘占用。

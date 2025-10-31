@@ -12,10 +12,10 @@ class TrainingConfig:
 
     loop_manifest: str = "loop_5kb.jsonl"
     stripe_manifest: str = "stripe_10kb.jsonl"
-    tad_manifest: str = "tad_10kb_1d.jsonl"
+    tad_manifest: str = "tad_10kb_2d.jsonl"
+    tad_binsize: int = 10000
     loop_label: str = "loop_5kb.jsonl"
     stripe_label: str = "stripe_10kb.jsonl"
-    tad_label: str = "tad_boundaries_10kb.bed"
 
     # Patch geometry
     loop_patch: int = 256
@@ -24,10 +24,7 @@ class TrainingConfig:
     stripe_patch: int = 320
     stripe_center: int = 256
     stripe_stride: int = 128
-    tad_length: int = 1024
-    tad_stride: int = 512
     tad_band_width: int = 64
-    tad_ignore_bins: int = 32
 
     # Data loader
     batch_size_loop: int = 4
@@ -54,7 +51,34 @@ class TrainingConfig:
     loop_pos_weight: float = 20000.0
     stripe_pos_weight: float = 25.0
     stripe_area_weight: float = 0.05
-    tad_pos_weight: float = 8.0
+    stripe_orientation_weight: float = 0.05
+    tad_domain_threshold: float = 0.4
+    tad_domain_map_weight: float = 1.0
+    tad_min_bins: int = 2
+    tad_boundary_weight: float = 1.0
+    tad_boundary_pos_weight: float = 6.0
+    tad_boundary_threshold: float = 0.4
+    tad_boundary_smooth: int = 3
+    tad_domain_label: str = "tad_domains_10kb.bed"
+    use_tad_detector: bool = False
+    tad_detector_backbone: str = "resnet34"
+    tad_detector_pretrained: bool = False
+    lambda_tad_detector: float = 1.0
+    tad_detection_min_bins: int = 4
+    tad_detection_max_instances: int = 16
+    tad_detection_score_thresh: float = 0.5
+    tad_detection_iou_thresh: float = 0.3
+    backbone_type: str = "unet"
+    gcn_kernel_size: int = 9
+    gcn_dilation: int = 1
+    gcn_drop_path: float = 0.1
+    gcn_stage_blocks: List[int] = field(default_factory=lambda: [1, 1, 1, 1])
+    gcn_run_on_cpu: bool = False
+
+    # Trident 专用超参
+    trident_stripe_kernel: int = 17
+    trident_tad_downstages: int = 2
+    trident_use_axial: bool = True
 
     # Multi-task balancing
     use_gradnorm: bool = True
@@ -73,6 +97,7 @@ class TrainingConfig:
     base_channels: int = 64
     use_axial_attention: bool = True
     use_tqdm: bool = True
+    input_channels: int = 3
 
 
 def build_default_config() -> TrainingConfig:

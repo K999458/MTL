@@ -45,15 +45,41 @@ def masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor, mask: Optional[
     return loss.mean()
 
 
-def tad_loss(pred_logits: torch.Tensor, target: torch.Tensor, ignore: torch.Tensor, positive_weight: float = 1.0) -> torch.Tensor:
-    mask = ignore
-    bce = masked_bce_loss(pred_logits, target, mask=mask, positive_weight=positive_weight)
-    dice = dice_loss((pred_logits * mask).unsqueeze(1), (target * mask).unsqueeze(1))
-    return bce + dice
+def tad_loss(domain_map_logits: torch.Tensor,
+             domain_map_target: torch.Tensor,
+             boundary_map_logits: Optional[torch.Tensor] = None,
+             boundary_map_target: Optional[torch.Tensor] = None,
+             boundary_weight_map: Optional[torch.Tensor] = None,
+             map_weight: float = 1.0,
+             boundary_weight: float = 1.0,
+             boundary_pos_weight: float = 5.0) -> Dict[str, torch.Tensor]:
+    results: Dict[str, torch.Tensor] = {}
+    dom_bce = F.binary_cross_entropy_with_logits(domain_map_logits, domain_map_target)
+    dom_dice = dice_loss(domain_map_logits, domain_map_target)
+    dom_total = (dom_bce + dom_dice) * map_weight
+    total = dom_total
+    results['map'] = dom_total
+
+    if boundary_map_logits is not None and boundary_map_target is not None and boundary_weight > 0.0:
+        if boundary_weight_map is not None:
+            weight = torch.where(boundary_weight_map > 0.5, boundary_pos_weight, 1.0)
+        else:
+            weight = torch.where(boundary_map_target > 0.5, boundary_pos_weight, 1.0)
+        bce = F.binary_cross_entropy_with_logits(boundary_map_logits, boundary_map_target, reduction='none')
+        denom = (weight).sum() + 1e-6
+        bce = (bce * weight).sum() / denom
+        dice = dice_loss(boundary_map_logits, boundary_map_target)
+        boundary_total = (bce + dice) * boundary_weight
+        total = total + boundary_total
+        results['boundary'] = boundary_total
+
+    results['total'] = total
+    return results
 
 
 def stripe_loss(logits: torch.Tensor, target: torch.Tensor, boundary_prior: Optional[torch.Tensor] = None,
-                prior_weight: float = 0.05, positive_weight: float = 1.0, area_weight: float = 0.0) -> torch.Tensor:
+                prior_weight: float = 0.05, positive_weight: float = 1.0, area_weight: float = 0.0,
+                orientation_prior: Optional[torch.Tensor] = None, orientation_weight: float = 0.0) -> torch.Tensor:
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
     if positive_weight != 1.0:
         weight = torch.where(target > 0.5, positive_weight, 1.0)
@@ -67,10 +93,13 @@ def stripe_loss(logits: torch.Tensor, target: torch.Tensor, boundary_prior: Opti
         pred_mean = prob.mean()
         target_mean = target.mean()
         area_penalty = area_weight * torch.relu(pred_mean - target_mean)
+    prior_term = 0.0
     if boundary_prior is not None:
-        prior_loss = F.binary_cross_entropy_with_logits(logits, boundary_prior, reduction='mean')
-        return bce + dice + prior_weight * prior_loss + area_penalty
-    return bce + dice + area_penalty
+        prior_term = prior_weight * F.binary_cross_entropy_with_logits(logits, boundary_prior, reduction='mean')
+    orientation_term = 0.0
+    if orientation_prior is not None and orientation_weight > 0.0:
+        orientation_term = orientation_weight * F.binary_cross_entropy_with_logits(logits, orientation_prior, reduction='mean')
+    return bce + dice + prior_term + area_penalty + orientation_term
 
 
 def loop_loss(pred_heatmap: torch.Tensor, target_heatmap: torch.Tensor,

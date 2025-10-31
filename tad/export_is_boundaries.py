@@ -20,7 +20,7 @@ Only creates files under /storu/zkyang/AAA_MIL per project rules.
 """
 
 import argparse
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -80,6 +80,13 @@ def resolve_windowed_columns(df: pd.DataFrame, window_bp: Optional[int]):
             ib_suf = ib_like[0]
         if len(bs_like) == 1:
             bs_suf = bs_like[0]
+    elif window_bp is not None and bs_suf is None and bs_plain is None:
+        bs_like = [c for c in cols if c.startswith('boundary_strength_')]
+        if bs_like:
+            bs_suf = sorted(bs_like)[0]
+        ib_like = [c for c in cols if c.startswith('is_boundary_')]
+        if ib_suf is None and ib_plain is None and ib_like:
+            ib_suf = sorted(ib_like)[0]
 
     # Choose priority: suffix match > plain
     ib_col = ib_suf or ib_plain
@@ -91,16 +98,18 @@ def pick_boundaries(df: pd.DataFrame,
                     ib_col: Optional[str],
                     bs_col: Optional[str],
                     threshold: Optional[float],
-                    quantile: Optional[float]) -> pd.DataFrame:
-    # Prefer explicit is_boundary if present
-    if ib_col is not None and ib_col in df.columns:
-        mask = parse_bool_series(df[ib_col]).astype(bool)
-        return df.loc[mask]
-
-    # Else fallback to boundary_strength
+                    quantile: Optional[float],
+                    force_strength: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, float, Optional[str]]:
     if bs_col is None or bs_col not in df.columns:
-        raise ValueError("No 'is_boundary' or 'boundary_strength' column found (including window-suffixed variants)."
-                         " Re-run cooltools insulation with boundary calling, or pass the correct --window-bp.")
+        bs_like = [c for c in df.columns if c.startswith('boundary_strength')]
+        if bs_like:
+            bs_col = sorted(bs_like)[0]
+        elif ib_col is not None and ib_col in df.columns:
+            mask = parse_bool_series(df[ib_col]).astype(bool)
+            return df.loc[mask], df.loc[~mask], float('nan'), bs_col
+        else:
+            raise ValueError("No 'is_boundary' or 'boundary_strength' column found (including window-suffixed variants)."
+                             " Re-run cooltools insulation with boundary calling, or pass the correct --window-bp.")
 
     bs = pd.to_numeric(df[bs_col], errors='coerce')
     if threshold is not None:
@@ -108,7 +117,11 @@ def pick_boundaries(df: pd.DataFrame,
     else:
         q = 95.0 if quantile is None else float(quantile)
         thr = float(np.nanpercentile(bs.values, q))
-    return df.loc[bs >= thr]
+
+    pos_mask = bs >= thr
+    pos_df = df.loc[pos_mask]
+    neg_df = df.loc[~pos_mask]
+    return pos_df, neg_df, thr, bs_col
 
 
 def dedupe_min_distance(bed: pd.DataFrame, min_dist_bp: int) -> pd.DataFrame:
@@ -151,26 +164,70 @@ def main():
     ap.add_argument('--include', type=str, default=None, help='Comma-separated chroms to include (e.g., 1,2,...,22,X)')
     ap.add_argument('--exclude', type=str, default='Y,MT', help='Comma-separated chroms to exclude [default: Y,MT]')
     ap.add_argument('--min-distance-bp', type=int, default=0, help='Minimum spacing between boundaries per chrom, in bp (deduplicate)')
-    ap.add_argument('--out', required=True, help='Output BED path')
+    ap.add_argument('--out', required=True, help='Output BED path (positive boundaries)')
+    ap.add_argument('--neg-out', default='', help='Optional BED path for negative boundaries (below threshold)')
+    ap.add_argument('--seed', type=int, default=1337, help='Random seed for negative sampling balance')
     args = ap.parse_args()
 
     df = pd.read_csv(args.tsv, sep='\t', low_memory=False)
     ib_col, bs_col = resolve_windowed_columns(df, args.window_bp)
     df = select_chroms(df, args.include, args.exclude)
-    sel = pick_boundaries(df, ib_col, bs_col, args.threshold, args.quantile)
+    force_strength = args.threshold is not None
+    pos_df, neg_df, thr, bs_col = pick_boundaries(df, ib_col, bs_col, args.threshold, args.quantile, force_strength=force_strength)
 
-    # Build a BED-like frame; keep strength if available for optional dedupe
     bed_cols = ['chrom', 'start', 'end']
-    if bs_col is not None and bs_col in sel.columns:
-        # keep strength for optional dedupe
+    if bs_col is not None:
         bed_cols.append(bs_col)
-    bed = sel[bed_cols].copy()
 
+    pos_bed = pos_df[bed_cols].copy()
     if args.min_distance_bp > 0:
-        bed = dedupe_min_distance(bed, args.min_distance_bp)
+        pos_bed = dedupe_min_distance(pos_bed, args.min_distance_bp)
 
-    bed[['chrom', 'start', 'end']].to_csv(args.out, sep='\t', header=False, index=False)
-    print(f"[export] wrote {args.out} (n={len(bed)})")
+    rng = np.random.default_rng(args.seed)
+    if args.neg_out:
+        if len(pos_bed) > 0 and bs_col is not None and len(neg_df) > 0 and np.isfinite(thr):
+            total_neg = len(pos_bed)
+            thr_low = float(thr) / 2.0
+            neg_bs_full = pd.to_numeric(neg_df[bs_col], errors='coerce')
+
+            def sample_df(dataframe: pd.DataFrame, count: int) -> pd.DataFrame:
+                if len(dataframe) <= count:
+                    return dataframe
+                idx = rng.choice(dataframe.index, size=count, replace=False)
+                return dataframe.loc[idx]
+
+            mid_df = neg_df[(neg_bs_full >= thr_low) & (neg_bs_full < thr)]
+            low_df = neg_df[neg_bs_full < thr_low]
+            remaining_df = neg_df.drop(mid_df.index.union(low_df.index))
+
+            target_mid = int(round(total_neg * 0.8))
+            mid_pick = sample_df(mid_df, min(target_mid, len(mid_df)))
+
+            remaining_target = total_neg - len(mid_pick)
+            target_low = max(int(round(total_neg * 0.2)), remaining_target)
+            low_pick = sample_df(low_df, min(target_low, len(low_df)))
+
+            neg_selected = pd.concat([mid_pick, low_pick], axis=0)
+            remaining_needed = total_neg - len(neg_selected)
+            if remaining_needed > 0:
+                pool = neg_df.drop(neg_selected.index)
+                extra = sample_df(pool, min(remaining_needed, len(pool)))
+                neg_selected = pd.concat([neg_selected, extra], axis=0)
+
+            neg_selected = neg_selected.head(total_neg)
+        else:
+            neg_selected = neg_df.head(len(pos_bed)) if len(pos_bed) > 0 else neg_df.iloc[0:0]
+
+        neg_bed = neg_selected[bed_cols].copy()
+    else:
+        neg_bed = neg_df[bed_cols].copy()
+
+    pos_bed[['chrom', 'start', 'end']].to_csv(args.out, sep='\t', header=False, index=False)
+    print(f"[export] positives -> {args.out} (n={len(pos_bed)})")
+
+    if args.neg_out:
+        neg_bed[['chrom', 'start', 'end']].to_csv(args.neg_out, sep='\t', header=False, index=False)
+        print(f"[export] negatives -> {args.neg_out} (n={len(neg_bed)})")
 
 
 if __name__ == '__main__':
