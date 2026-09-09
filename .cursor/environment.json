@@ -1,0 +1,4 @@
+{
+  "name": "MTL Hi-C multi-task pipeline",
+  "install": "bash .cursor/install.sh"
+}
